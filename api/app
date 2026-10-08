@@ -1,0 +1,125 @@
+"""
+FastAPI Enterprise Backend (Session 8 & Session 10):
+- REST API for Chat & Agent Orchestration
+- Endpoints for Order lookups, Ticket management, and Human Supervisor Approvals
+"""
+
+import os
+import sys
+import sqlite3
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(BASE_DIR)
+
+from src.orchestrator import AutonomousSupportOrchestrator
+from src.tools.refund_tools import process_refund
+from src.tools.order_tools import get_order_details
+
+app = FastAPI(
+    title="Autonomous Customer Operations Hub API",
+    description="Multi-Agent AI Support System with RAG, Memory, Guardrails, and Human-in-the-Loop",
+    version="1.0.0"
+)
+
+# Persistent orchestrator instances per session
+sessions: Dict[str, AutonomousSupportOrchestrator] = {}
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = "default_session"
+
+class ApprovalRequest(BaseModel):
+    ticket_id: str
+    notes: Optional[str] = "Approved by human operations manager."
+
+def get_orchestrator(session_id: str) -> AutonomousSupportOrchestrator:
+    if session_id not in sessions:
+        sessions[session_id] = AutonomousSupportOrchestrator()
+    return sessions[session_id]
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "system": "Autonomous Customer Operations Hub",
+        "agents": ["TriageAgent", "RAGAgent", "ActionAgent", "QASupervisor"],
+        "docs_url": "/docs"
+    }
+
+@app.post("/api/chat")
+def chat_endpoint(req: ChatRequest):
+    orchestrator = get_orchestrator(req.session_id)
+    result = orchestrator.process_message(req.message)
+    return result
+
+@app.get("/api/orders/{order_id}")
+def order_endpoint(order_id: str):
+    res = get_order_details(order_id)
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("error"))
+    return res
+
+@app.get("/api/tickets")
+def list_tickets():
+    db_path = os.path.join(BASE_DIR, "data", "support_system.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT ticket_id, customer_id, order_id, category, priority, status, subject, requires_human_approval, created_at 
+        FROM tickets 
+        ORDER BY created_at DESC
+    """)
+    tickets = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"tickets": tickets}
+
+@app.post("/api/tickets/{ticket_id}/approve")
+def approve_ticket(ticket_id: str, req: ApprovalRequest):
+    """Human-in-the-loop: Supervisor approves an escalated refund ticket."""
+    db_path = os.path.join(BASE_DIR, "data", "support_system.db")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT order_id, status FROM tickets WHERE ticket_id = ?", (ticket_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Ticket {ticket_id} not found.")
+
+    order_id, status = row
+    if not order_id:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Ticket has no associated order.")
+
+    # Execute refund with human_approved=True
+    refund_res = process_refund(order_id, reason=req.notes, human_approved=True)
+
+    # Update ticket status
+    cursor.execute("""
+        UPDATE tickets 
+        SET status = 'Resolved', resolution_notes = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE ticket_id = ?
+    """, (f"Human Approval: {req.notes}", ticket_id))
+
+    cursor.execute("""
+        INSERT INTO audit_logs (ticket_id, action_name, actor, details)
+        VALUES (?, 'HUMAN_SUPERVISOR_APPROVAL', 'Human_Supervisor', ?)
+    """, (ticket_id, f"Supervisor authorized ticket {ticket_id}. Refund executed: {refund_res.get('message')}"))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "ticket_id": ticket_id,
+        "new_status": "Resolved",
+        "refund_details": refund_res
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api.app:app", host="127.0.0.1", port=8000, reload=True)
